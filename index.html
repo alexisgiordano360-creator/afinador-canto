@@ -62,6 +62,7 @@ input[type=file]{display:none}
   </div>
   <div class="row" id="trackRow" style="display:none">
     <select id="trackSel" aria-label="Pista del MIDI"></select>
+    <select id="cleanSel" aria-label="Limpieza" style="flex:0 0 auto;width:auto"><option value="0">Sin limpiar</option><option value="1">🧹 Suave</option><option value="2">🧹 Fuerte</option></select>
   </div>
 
   <div id="now">
@@ -161,7 +162,7 @@ function parseMidi(ab){
   const hl=u32(); const format=u16(), ntr=u16(), div=u16(); p+=hl-6;
   let smpteTPS=0;
   if(div&0x8000){ const fps=256-(div>>8); smpteTPS=fps*(div&0xff); }
-  const tempos=[]; const raw=[]; const names=[];
+  const tempos=[]; const raw=[]; const names=[]; let bends=0;
   for(let t=0;t<ntr && p<v.byteLength;t++){
     const id=str(4), len=u32(), end=p+len;
     if(id!=="MTrk"){ p=end; continue; }
@@ -176,6 +177,7 @@ function parseMidi(ab){
       } else if(st===0xF0||st===0xF7){ p+=vlq(); }
       else { const hi=st&0xF0, ch=st&0x0F;
         if(hi===0xC0||hi===0xD0){ p++; }
+        else if(hi===0xE0){ p+=2; bends++; }
         else { const a=u8(), b=u8(); if(hi===0x90||hi===0x80) raw.push({t, tick, ch, note:a, on: hi===0x90 && b>0}); }
       }
     }
@@ -203,7 +205,7 @@ function parseMidi(ab){
     const avg=g.notes.reduce((s,n)=>s+n.midi,0)/g.notes.length;
     return {name:(names[g.track]||("Pista "+(g.track+1)))+" · canal "+(g.ch+1), notes:g.notes, count:g.notes.length, avg};
   });
-  return {format, tracks};
+  return {format, tracks, bends};
 }
 
 // Deja una sola nota a la vez (la más aguda en acordes) para poder cantarla.
@@ -255,6 +257,37 @@ function seqToNotes(song){
 }
 if(typeof module!=="undefined") module.exports={noteName,freqToMidi,midiToFreq,detectPitch,parseMidi,toMonophonic,guessMelodyTrack,PD_SONGS,SCALES,seqToNotes};
 
+// Limpia melodías convertidas desde audio (voz grabada): corrige saltos de octava falsos,
+// une fragmentos de la misma nota y absorbe notas muy cortas.
+function cleanVoice(notes, strong=false){
+  const minD=strong?0.3:0.15, tolS=strong?2:2, gapM=strong?0.3:0.2;
+  let n=notes.map(x=>({...x})).sort((a,b)=>a.start-b.start);
+  for(let pass=0;pass<2;pass++){
+    const src=n.map(x=>x.midi);
+    n.forEach((x,i)=>{
+      const w=[]; for(let j=Math.max(0,i-4);j<=Math.min(n.length-1,i+4);j++) if(j!==i) w.push(src[j]);
+      if(!w.length) return; w.sort((a,b)=>a-b); const ref=w[Math.floor(w.length/2)];
+      while(x.midi-ref>6) x.midi-=12; while(ref-x.midi>6) x.midi+=12;
+    });
+  }
+  const merge=arr=>{ const out=[];
+    for(const x of arr){ const L=out[out.length-1];
+      if(L && x.midi===L.midi && x.start-(L.start+L.dur)<0.2){ L.dur=Math.max(L.dur,x.start+x.dur-L.start); continue; }
+      out.push(x); } return out; };
+  n=merge(n);
+  const out=[];
+  for(const x of n){ const L=out[out.length-1];
+    if(x.dur<minD){
+      if(L && x.start-(L.start+L.dur)<gapM && Math.abs(x.midi-L.midi)<=tolS){ L.dur=Math.max(L.dur,x.start+x.dur-L.start); continue; }
+      if(x.dur<0.1) continue;
+    }
+    out.push(x); }
+  let res=merge(out);
+  if(strong) res=res.filter(x=>x.dur>=0.12);
+  return res;
+}
+if(typeof module!=="undefined") module.exports.cleanVoice=cleanVoice;
+
 
 // ===== App =====
 const $=id=>document.getElementById(id);
@@ -298,13 +331,15 @@ $("midiFile").onchange=async e=>{
     const ts=$("trackSel"); ts.innerHTML="";
     r.tracks.forEach((t,i)=>{ const o=document.createElement("option"); o.value=i; o.textContent=t.name+" ("+t.count+" notas, ~"+noteName(t.avg)+")"; ts.appendChild(o); });
     ts.value=guessMelodyTrack(r.tracks);
+    $("cleanSel").value = r.bends>50 ? "2" : "0";
     fillSongs(); $("songSel").value="midi"; $("trackRow").style.display="flex"; loadTrack();
-    toast("Elegí la pista de la voz si no es la correcta 👆");
+    toast(r.bends>50 ? "Parece una voz grabada: la limpié para que queden notas largas 🧹" : "Elegí la pista de la voz si no es la correcta 👆");
   }catch(err){ toast("No pude leer ese archivo: "+err.message); }
   e.target.value="";
 };
-function loadTrack(){ const t=midiData.tracks[+$("trackSel").value]; setSong(midiData.file, toMonophonic(t.notes)); }
-$("trackSel").onchange=loadTrack;
+function loadTrack(){ const t=midiData.tracks[+$("trackSel").value], cl=+$("cleanSel").value;
+  let n=toMonophonic(t.notes); if(cl) n=cleanVoice(n, cl===2); setSong(midiData.file, n); }
+$("trackSel").onchange=loadTrack; $("cleanSel").onchange=loadTrack;
 
 // ---- Ajustes ----
 function setT(v){ transpose=Math.max(-24,Math.min(24,v)); $("tVal").textContent=(transpose>0?"+":"")+transpose; draw(); }
