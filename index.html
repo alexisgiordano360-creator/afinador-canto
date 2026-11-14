@@ -162,7 +162,7 @@ function parseMidi(ab){
   const hl=u32(); const format=u16(), ntr=u16(), div=u16(); p+=hl-6;
   let smpteTPS=0;
   if(div&0x8000){ const fps=256-(div>>8); smpteTPS=fps*(div&0xff); }
-  const tempos=[]; const raw=[]; const names=[]; let bends=0;
+  const tempos=[]; const raw=[]; const names=[]; let bends=0; const bendEv={};
   for(let t=0;t<ntr && p<v.byteLength;t++){
     const id=str(4), len=u32(), end=p+len;
     if(id!=="MTrk"){ p=end; continue; }
@@ -177,7 +177,7 @@ function parseMidi(ab){
       } else if(st===0xF0||st===0xF7){ p+=vlq(); }
       else { const hi=st&0xF0, ch=st&0x0F;
         if(hi===0xC0||hi===0xD0){ p++; }
-        else if(hi===0xE0){ p+=2; bends++; }
+        else if(hi===0xE0){ const lo=u8(), hb=u8(); bends++; (bendEv[t+"_"+ch]=bendEv[t+"_"+ch]||[]).push({tick, v:((hb<<7)|lo)-8192}); }
         else { const a=u8(), b=u8(); if(hi===0x90||hi===0x80) raw.push({t, tick, ch, note:a, on: hi===0x90 && b>0}); }
       }
     }
@@ -198,7 +198,10 @@ function parseMidi(ab){
     if(e.on){ if(!open.has(key)) open.set(key,[]); open.get(key).push(e.tick); }
     else { const q=open.get(key); if(q&&q.length){ const st=q.shift(); const gk=e.t+"_"+e.ch;
       if(!groups.has(gk)) groups.set(gk,{track:e.t, ch:e.ch, notes:[]});
-      const s=toSec(st); groups.get(gk).notes.push({midi:e.note, start:s, dur:Math.max(0.03,toSec(e.tick)-s)}); } }
+      const s=toSec(st); let bend=0; const be=bendEv[gk];
+      if(be){ const vs=[]; let last=0; for(const x of be){ if(x.tick<=st) last=x.v; else if(x.tick<e.tick) vs.push(x.v); else break; }
+        vs.push(last); vs.sort((a,b)=>a-b); bend=vs[Math.floor(vs.length/2)]*2/8192; }
+      groups.get(gk).notes.push({midi:e.note, bend, start:s, dur:Math.max(0.03,toSec(e.tick)-s)}); } }
   }
   const tracks=[...groups.values()].filter(g=>g.ch!==9 && g.notes.length>0).map(g=>{
     g.notes.sort((a,b)=>a.start-b.start);
@@ -257,34 +260,53 @@ function seqToNotes(song){
 }
 if(typeof module!=="undefined") module.exports={noteName,freqToMidi,midiToFreq,detectPitch,parseMidi,toMonophonic,guessMelodyTrack,PD_SONGS,SCALES,seqToNotes};
 
-// Limpia melodías convertidas desde audio (voz grabada): corrige saltos de octava falsos,
-// une fragmentos de la misma nota y absorbe notas muy cortas.
+// Melodías convertidas desde audio (voz grabada): usa la afinación real (nota + pitch bend),
+// descarta armónicos y ruido, deja una sola línea y une los fragmentos de la misma nota.
 function cleanVoice(notes, strong=false){
-  const minD=strong?0.3:0.15, tolS=strong?2:2, gapM=strong?0.3:0.2;
-  let n=notes.map(x=>({...x})).sort((a,b)=>a.start-b.start);
-  for(let pass=0;pass<2;pass++){
-    const src=n.map(x=>x.midi);
-    n.forEach((x,i)=>{
-      const w=[]; for(let j=Math.max(0,i-4);j<=Math.min(n.length-1,i+4);j++) if(j!==i) w.push(src[j]);
-      if(!w.length) return; w.sort((a,b)=>a-b); const ref=w[Math.floor(w.length/2)];
-      while(x.midi-ref>6) x.midi-=12; while(ref-x.midi>6) x.midi+=12;
-    });
+  if(!notes.length) return [];
+  const med=arr=>{ const s=[...arr].sort((a,b)=>a-b); return s[Math.floor(s.length/2)]; };
+  // desafinación general de la grabación (si toda la voz está un poco alta o baja, se compensa)
+  const bw=[]; notes.forEach(x=>{ if(x.bend){ for(let k=0;k<Math.max(1,Math.round(x.dur*10));k++) bw.push(x.bend); } });
+  const off=bw.length? med(bw) : 0;
+  let n=notes.map(x=>{ const f=x.midi+(x.bend||0)-off; return {...x, midi:Math.round(f), frac:f-Math.round(f)}; }).sort((a,b)=>a.start-b.start);
+  if(strong){ // ajusta notas sueltas fuera de la escala de la canción a la nota vecina
+    const pc=new Array(12).fill(0); let tot=0; n.forEach(x=>{ pc[((x.midi%12)+12)%12]+=x.dur; tot+=x.dur; });
+    const inS=m=>pc[((m%12)+12)%12] >= 0.06*tot;
+    n.forEach(x=>{ if(inS(x.midi)) return; const up=inS(x.midi+1), dn=inS(x.midi-1);
+      if(up&&dn) x.midi += (x.frac>0 || (x.frac===0 && pc[((x.midi+1)%12+12)%12]>=pc[((x.midi-1)%12+12)%12])) ? 1 : -1;
+      else if(up) x.midi++; else if(dn) x.midi--; });
   }
+  // registro central (ponderado por duración)
+  const w=[]; n.forEach(x=>{ for(let k=0;k<Math.max(1,Math.round(x.dur*10));k++) w.push(x.midi); });
+  const M=med(w);
+  n=n.filter(x=>Math.abs(x.midi-M)<=14);
+  // una sola línea: ante notas simultáneas, queda la más cercana a lo que se venía cantando
+  let line=[];
+  for(const x of n){ const L=line[line.length-1];
+    const ref=line.length? med(line.slice(-5).map(y=>y.midi)) : M;
+    if(L && x.start < L.start+L.dur-0.03){
+      const ov=L.start+L.dur-x.start;
+      if(ov > 0.5*Math.min(x.dur,L.dur)){ if(Math.abs(x.midi-ref) < Math.abs(L.midi-ref)) line[line.length-1]=x; continue; }
+      L.dur=x.start-L.start;
+    }
+    line.push(x); }
+  n=line.filter(x=>x.dur>=0.05);
+  // saltos de octava falsos
+  const src=n.map(x=>x.midi);
+  n.forEach((x,i)=>{ const v=[]; for(let j=Math.max(0,i-4);j<=Math.min(n.length-1,i+4);j++) if(j!==i) v.push(src[j]);
+    if(!v.length) return; const r=med(v); while(x.midi-r>7) x.midi-=12; while(r-x.midi>7) x.midi+=12; });
+  const gap=strong?0.5:0.25;
   const merge=arr=>{ const out=[];
     for(const x of arr){ const L=out[out.length-1];
-      if(L && x.midi===L.midi && x.start-(L.start+L.dur)<0.2){ L.dur=Math.max(L.dur,x.start+x.dur-L.start); continue; }
+      if(L && x.midi===L.midi && x.start-(L.start+L.dur)<gap){ L.dur=Math.max(L.dur,x.start+x.dur-L.start); continue; }
       out.push(x); } return out; };
   n=merge(n);
+  // adornos muy cortos: se absorben en la nota anterior; el resto se respeta
   const out=[];
   for(const x of n){ const L=out[out.length-1];
-    if(x.dur<minD){
-      if(L && x.start-(L.start+L.dur)<gapM && Math.abs(x.midi-L.midi)<=tolS){ L.dur=Math.max(L.dur,x.start+x.dur-L.start); continue; }
-      if(x.dur<0.1) continue;
-    }
+    if(x.dur<0.12){ if(L && x.start-(L.start+L.dur)<0.15) L.dur=x.start+x.dur-L.start; continue; }
     out.push(x); }
-  let res=merge(out);
-  if(strong) res=res.filter(x=>x.dur>=0.12);
-  return res;
+  return merge(out);
 }
 if(typeof module!=="undefined") module.exports.cleanVoice=cleanVoice;
 
@@ -338,7 +360,7 @@ $("midiFile").onchange=async e=>{
   e.target.value="";
 };
 function loadTrack(){ const t=midiData.tracks[+$("trackSel").value], cl=+$("cleanSel").value;
-  let n=toMonophonic(t.notes); if(cl) n=cleanVoice(n, cl===2); setSong(midiData.file, n); }
+  const n= cl ? cleanVoice(t.notes, cl===2) : toMonophonic(t.notes); setSong(midiData.file, n); }
 $("trackSel").onchange=loadTrack; $("cleanSel").onchange=loadTrack;
 
 // ---- Ajustes ----
