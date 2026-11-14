@@ -235,12 +235,25 @@ const PD_SONGS = [
   {name:"Cumpleaños feliz", bpm:100, seq:[[55,0.75],[55,0.25],[57,1],[55,1],[60,1],[59,2],[55,0.75],[55,0.25],[57,1],[55,1],[62,1],[60,2],
     [55,0.75],[55,0.25],[67,1],[64,1],[60,1],[59,1],[57,2],[65,0.75],[65,0.25],[64,1],[60,1],[62,1],[60,3]]},
 ];
+// Escalas con notas largas (2,5 s de nota + 0,5 s para respirar), base Do3
+function scaleSong(name, degs){
+  const up=degs.map(d=>48+d), seq=[];
+  for(const m of [...up, ...up.slice(0,-1).reverse()]) seq.push([m,2.5],[0,0.5]);
+  return {name, bpm:60, seq};
+}
+const SCALES = [
+  scaleSong("Calentamiento: 5 notas (Do–Sol)", [0,2,4,5,7]),
+  scaleSong("Escala mayor (Do)", [0,2,4,5,7,9,11,12]),
+  scaleSong("Escala menor natural (Do)", [0,2,3,5,7,8,10,12]),
+  scaleSong("Pentatónica mayor (Do)", [0,2,4,7,9,12]),
+  scaleSong("Arpegio mayor (Do–Mi–Sol–Do)", [0,4,7,12]),
+];
 function seqToNotes(song){
   const b=60/song.bpm; let t=0; const out=[];
   for(const [m,beats] of song.seq){ if(m>0) out.push({midi:m, start:t, dur:beats*b*0.95}); t+=beats*b; }
   return out;
 }
-if(typeof module!=="undefined") module.exports={noteName,freqToMidi,midiToFreq,detectPitch,parseMidi,toMonophonic,guessMelodyTrack,PD_SONGS,seqToNotes};
+if(typeof module!=="undefined") module.exports={noteName,freqToMidi,midiToFreq,detectPitch,parseMidi,toMonophonic,guessMelodyTrack,PD_SONGS,SCALES,seqToNotes};
 
 
 // ===== App =====
@@ -265,13 +278,15 @@ function setSong(name, notes){
 }
 function fillSongs(){
   const s=$("songSel"); s.innerHTML="";
-  PD_SONGS.forEach((x,i)=>{ const o=document.createElement("option"); o.value="pd"+i; o.textContent=x.name; s.appendChild(o); });
+  const grp=(label,list,pre)=>{ const g=document.createElement("optgroup"); g.label=label;
+    list.forEach((x,i)=>{ const o=document.createElement("option"); o.value=pre+i; o.textContent=x.name; g.appendChild(o); }); s.appendChild(g); };
+  grp("🎵 Canciones",PD_SONGS,"pd"); grp("🎼 Escalas (notas largas)",SCALES,"sc");
   if(midiData){ const o=document.createElement("option"); o.value="midi"; o.textContent="📂 "+midiData.file; s.appendChild(o); }
 }
 $("songSel").onchange=e=>{
   const v=e.target.value;
   if(v==="midi"){ $("trackRow").style.display="flex"; loadTrack(); }
-  else { $("trackRow").style.display="none"; const sg=PD_SONGS[+v.slice(2)]; setSong(sg.name, seqToNotes(sg)); }
+  else { $("trackRow").style.display="none"; const sg=(v.startsWith("sc")?SCALES:PD_SONGS)[+v.slice(2)]; setSong(sg.name, seqToNotes(sg)); }
 };
 $("midiBtn").onclick=()=>$("midiFile").click();
 $("midiFile").onchange=async e=>{
