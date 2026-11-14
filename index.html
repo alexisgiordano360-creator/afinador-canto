@@ -93,7 +93,7 @@ input[type=file]{display:none}
       <span>Exigencia</span>
       <div class="row"><select id="tol"><option value="1">Fácil (±1 semitono)</option><option value="0.5" selected>Normal (±½ semitono)</option><option value="0.25">Difícil (±¼ semitono)</option></select></div>
       <span>Opciones</span>
-      <div class="toggle"><button class="chip on" id="guideT">🔊 Guía sonora</button><button class="chip on" id="octT">🔁 Octava libre</button></div>
+      <div class="toggle"><button class="chip on" id="guideT">🔊 Guía sonora</button><button class="chip" id="audT" style="display:none">🎧 Mi audio</button><button class="chip on" id="octT">🔁 Octava libre</button></div>
     </div>
   </details>
 </div>
@@ -347,6 +347,9 @@ let song=null, midiData=null;
 let transpose=0, rate=1, guide=true, octFree=true, tol=0.5;
 let playing=false, offset=0, t0=0, nextIdx=0, oscs=[], wakeLock=null, beeps=[];
 let hist=[], rawHist=[], lastSung=null, holdFrames=0;
+const audEl=new Audio(); audEl.preload="auto"; let useAudio=false, audStarted=false, audUrl=null;
+function audNow(){ return useAudio && song && song.audio && transpose===0; }
+function updChips(){ const has=!!(song&&song.audio); $("audT").style.display=has?"":"none"; $("audT").classList.toggle("on",has&&useAudio); $("guideT").classList.toggle("on",guide); }
 
 function toast(msg){ const t=$("toast"); t.textContent=msg; t.style.display="block"; clearTimeout(toast._t); toast._t=setTimeout(()=>t.style.display="none",3500); }
 function fmt(s){ s=Math.max(0,s); return Math.floor(s/60)+":"+String(Math.floor(s%60)).padStart(2,"0"); }
@@ -356,9 +359,9 @@ function setSong(name, notes){
   const shift = notes.length ? notes[0].start-1 : 0;
   notes.forEach(n=>n.start-=shift);
   const end = notes.length ? Math.max(...notes.map(n=>n.start+n.dur)) : 0;
-  song={name, notes, duration:end+0.5,
+  song={name, notes, shift, duration:end+0.5,
     lo:Math.min(...notes.map(n=>n.midi)), hi:Math.max(...notes.map(n=>n.midi))};
-  offset=0; hist=[]; updScore(); draw();
+  offset=0; hist=[]; updScore(); draw(); updChips();
 }
 function fillSongs(){
   const s=$("songSel"); s.innerHTML="";
@@ -378,9 +381,11 @@ $("midiFile").onchange=async e=>{
   try{
     const ab=await f.arrayBuffer();
     const isMidi=String.fromCharCode(...new Uint8Array(ab.slice(0,4)))==="MThd";
-    const r= isMidi ? parseMidi(ab) : await audioFileToTracks(ab);
+    const r= isMidi ? parseMidi(ab) : await audioFileToTracks(ab.slice(0));
     if(!r.tracks.length){ toast("No encontré una melodía que se pueda usar en ese archivo 😕"); return; }
-    midiData={file:f.name.replace(/\.[a-z0-9]+$/i,""), tracks:r.tracks};
+    midiData={file:f.name.replace(/\.[a-z0-9]+$/i,""), tracks:r.tracks, audio:!isMidi};
+    if(audUrl){ URL.revokeObjectURL(audUrl); audUrl=null; }
+    if(!isMidi){ audUrl=URL.createObjectURL(f); audEl.src=audUrl; useAudio=true; guide=false; }
     const ts=$("trackSel"); ts.innerHTML="";
     r.tracks.forEach((t,i)=>{ const o=document.createElement("option"); o.value=i; o.textContent=t.name+" ("+t.count+" notas, ~"+noteName(t.avg)+")"; ts.appendChild(o); });
     ts.value=guessMelodyTrack(r.tracks);
@@ -406,15 +411,16 @@ async function audioFileToTracks(ab){
   return {tracks:[{name:"Voz del audio", notes, count:notes.length, avg:notes.reduce((s,n)=>s+n.midi,0)/notes.length}], bends:999};
 }
 function loadTrack(){ const t=midiData.tracks[+$("trackSel").value], cl=+$("cleanSel").value;
-  const n= cl ? cleanVoice(t.notes, cl===2) : toMonophonic(t.notes); setSong(midiData.file, n); }
+  const n= cl ? cleanVoice(t.notes, cl===2) : toMonophonic(t.notes); setSong(midiData.file, n); song.audio=!!midiData.audio; updChips(); }
 $("trackSel").onchange=loadTrack; $("cleanSel").onchange=loadTrack;
 
 // ---- Ajustes ----
-function setT(v){ transpose=Math.max(-24,Math.min(24,v)); $("tVal").textContent=(transpose>0?"+":"")+transpose; draw(); }
+function setT(v){ transpose=Math.max(-24,Math.min(24,v)); if(useAudio&&song&&song.audio){ if(transpose!==0){ audEl.pause(); audStarted=false; toast("Tu audio no se puede cambiar de tono: mientras tanto suena la guía sonora"); } if(playing) resetGuide(); } $("tVal").textContent=(transpose>0?"+":"")+transpose; draw(); }
 $("tDown").onclick=()=>setT(transpose-1); $("tUp").onclick=()=>setT(transpose+1);
-$("rate").onchange=e=>{ const st=songTime(); rate=+e.target.value; if(playing){ offset=st; t0=ctx.currentTime; resetGuide(); } };
+$("rate").onchange=e=>{ const st=songTime(); rate=+e.target.value; if(playing){ offset=st; t0=ctx.currentTime; resetGuide(); } audEl.playbackRate=rate; };
 $("tol").onchange=e=>tol=+e.target.value;
-$("guideT").onclick=e=>{ guide=!guide; e.target.classList.toggle("on",guide); if(!guide) killOscs(); else if(playing) resetGuide(); };
+$("guideT").onclick=()=>{ guide=!guide; if(guide){ useAudio=false; audEl.pause(); audStarted=false; } updChips(); if(!guide) killOscs(); else if(playing) resetGuide(); };
+$("audT").onclick=()=>{ useAudio=!useAudio; if(useAudio){ guide=false; killOscs(); } else { audEl.pause(); audStarted=false; } updChips(); };
 $("octT").onclick=e=>{ octFree=!octFree; e.target.classList.toggle("on",octFree); };
 
 // ---- Micrófono ----
@@ -446,7 +452,7 @@ function tone(freq, at, dur, vol=0.14, type="triangle"){
   o.connect(g).connect(ctx.destination); o.start(at); o.stop(at+dur+0.02); return o;
 }
 function scheduleGuide(st){
-  if(!guide) return;
+  if(!(guide || (useAudio && song.audio && transpose!==0))) return;
   while(nextIdx<song.notes.length && song.notes[nextIdx].start < st+1.2){
     const n=song.notes[nextIdx++]; const at=t0+(n.start-offset)/rate;
     if(at>=ctx.currentTime-0.02) oscs.push(tone(midiToFreq(n.midi+transpose), Math.max(at,ctx.currentTime), n.dur/rate));
@@ -459,7 +465,8 @@ async function start(){
   if(offset>=song.duration-0.3) offset=0;
   song.notes.forEach(n=>{ if(n.start+n.dur>offset){ n.hit=0; n.tot=0; } });
   hist=hist.filter(h=>h.t<offset);
-  const now=ctx.currentTime; t0=now+2; playing=true;
+  const now=ctx.currentTime; t0=now+2; playing=true; audStarted=false;
+  if(audNow()){ try{ audEl.playbackRate=rate; audEl.preservesPitch=true; audEl.currentTime=Math.max(0,offset+song.shift); }catch(e){} }
   for(let i=0;i<2;i++) beeps.push(tone(i?1320:880, now+i, 0.08, 0.12, "sine"));
   resetGuide(); $("play").textContent="■ Parar"; $("play").classList.add("stop"); $("hint").style.display="none";
   try{ wakeLock=await navigator.wakeLock?.request("screen"); }catch(e){}
@@ -467,7 +474,7 @@ async function start(){
 function stop(){
   if(!playing) return;
   offset=Math.max(0,Math.min(songTime(), song.duration)); playing=false;
-  killOscs(); beeps.forEach(b=>{try{b.stop();}catch(e){}}); beeps=[];
+  audEl.pause(); audStarted=false; killOscs(); beeps.forEach(b=>{try{b.stop();}catch(e){}}); beeps=[];
   $("play").textContent="▶ Seguir"; $("play").classList.remove("stop"); $("count").style.display="none"; $("hint").style.display="block";
   try{ wakeLock?.release(); }catch(e){} wakeLock=null;
 }
@@ -498,6 +505,7 @@ window.addEventListener("pointerup",()=>drag=null);
 const cv=$("roll"), g2=cv.getContext("2d");
 function resize(){ const r=cv.getBoundingClientRect(), d=devicePixelRatio||1; cv.width=r.width*d; cv.height=r.height*d; g2.setTransform(d,0,0,d,0,0); draw(); }
 window.addEventListener("resize",resize);
+if(window.ResizeObserver) new ResizeObserver(()=>resize()).observe($("rollWrap"));
 function geo(){
   const w=cv.clientWidth, h=cv.clientHeight, gut=40;
   let lo=(song?song.lo:57)+transpose-3, hi=(song?song.hi:69)+transpose+3;
@@ -581,6 +589,9 @@ function loop(){
     const cd=t0-ctx.currentTime;
     $("count").style.display= cd>0?"flex":"none"; if(cd>0) $("count").textContent=Math.ceil(cd);
     scheduleGuide(st);
+    if(audNow() && cd<=0){ const at=st+song.shift;
+      if(!audStarted){ if(at>=0){ audStarted=true; try{ audEl.currentTime=at; }catch(e){} audEl.play().catch(()=>{}); } }
+      else if(!audEl.paused && Math.abs(audEl.currentTime-at)>0.25){ try{ audEl.currentTime=at; }catch(e){} } }
     if(st>=offset){
       const ok= t&&dm!=null ? Math.abs(dm-(t.midi+transpose))<=tol : (t?false:null);
       hist.push({t:st,m:dm,ok});
