@@ -57,8 +57,8 @@ input[type=file]{display:none}
 <div id="app">
   <div class="row">
     <select id="songSel" aria-label="Canción"></select>
-    <button class="icon" id="midiBtn" title="Cargar archivo MIDI">📂 MIDI</button>
-    <input type="file" id="midiFile" accept=".mid,.midi,audio/midi,audio/x-midi">
+    <button class="icon" id="midiBtn" title="Cargar un MIDI o un audio con tu voz">📂 Cargar</button>
+    <input type="file" id="midiFile" accept=".mid,.midi,audio/*">
   </div>
   <div class="row" id="trackRow" style="display:none">
     <select id="trackSel" aria-label="Pista del MIDI"></select>
@@ -310,6 +310,35 @@ function cleanVoice(notes, strong=false){
 }
 if(typeof module!=="undefined") module.exports.cleanVoice=cleanVoice;
 
+// Convierte audio (mono, Float32) en notas: detecta el tono cuadro a cuadro y lo agrupa.
+function audioToNotes(x, sr, onProgress){
+  const N=1024, hop=Math.round(sr*0.02), fr=[];
+  const total=Math.max(0,Math.floor((x.length-N)/hop));
+  for(let i=0;i<total;i++){ const f=detectPitch(x.subarray(i*hop,i*hop+N), sr, 70, 900); fr.push(f>0?freqToMidi(f):null); if(onProgress && i%500===0) onProgress(i/total); }
+  return framesToNotes(fr, hop/sr);
+}
+function framesToNotes(fr, dt){
+  const med=a=>{ const s=[...a].sort((p,q)=>p-q); return s[Math.floor(s.length/2)]; };
+  // suavizado (mediana de 5 cuadros)
+  const sm=fr.map((v,i)=>{ if(v==null) return null; const w=[]; for(let j=i-2;j<=i+2;j++) if(fr[j]!=null) w.push(fr[j]); return w.length>=3? med(w) : null; });
+  // afinación general de la grabación
+  const fracs=sm.filter(v=>v!=null).map(v=>v-Math.round(v)); const off=fracs.length? med(fracs) : 0;
+  const q=sm.map(v=>v==null?null:Math.round(v-off));
+  const notes=[]; let cur=null;
+  for(let i=0;i<q.length;i++){ const v=q[i], t=i*dt;
+    if(v==null){ if(cur && t-cur.end>0.08){ notes.push(cur); cur=null; } continue; }
+    if(cur && v===cur.midi){ cur.end=t+dt; continue; }
+    // un cambio de nota tiene que sostenerse al menos 3 cuadros
+    let ok=true; for(let j=1;j<3;j++) if(q[i+j]!==v){ ok=false; break; }
+    if(!ok){ if(cur) cur.end=t+dt; continue; }
+    if(cur) notes.push(cur);
+    cur={midi:v, start:t, end:t+dt};
+  }
+  if(cur) notes.push(cur);
+  return notes.map(n=>({midi:n.midi, start:n.start, dur:n.end-n.start})).filter(n=>n.dur>=0.08);
+}
+if(typeof module!=="undefined"){ module.exports.audioToNotes=audioToNotes; module.exports.framesToNotes=framesToNotes; }
+
 
 // ===== App =====
 const $=id=>document.getElementById(id);
@@ -347,18 +376,35 @@ $("midiBtn").onclick=()=>$("midiFile").click();
 $("midiFile").onchange=async e=>{
   const f=e.target.files[0]; if(!f) return;
   try{
-    const r=parseMidi(await f.arrayBuffer());
-    if(!r.tracks.length){ toast("Ese MIDI no tiene melodía que se pueda usar 😕"); return; }
-    midiData={file:f.name.replace(/\.midi?$/i,""), tracks:r.tracks};
+    const ab=await f.arrayBuffer();
+    const isMidi=String.fromCharCode(...new Uint8Array(ab.slice(0,4)))==="MThd";
+    const r= isMidi ? parseMidi(ab) : await audioFileToTracks(ab);
+    if(!r.tracks.length){ toast("No encontré una melodía que se pueda usar en ese archivo 😕"); return; }
+    midiData={file:f.name.replace(/\.[a-z0-9]+$/i,""), tracks:r.tracks};
     const ts=$("trackSel"); ts.innerHTML="";
     r.tracks.forEach((t,i)=>{ const o=document.createElement("option"); o.value=i; o.textContent=t.name+" ("+t.count+" notas, ~"+noteName(t.avg)+")"; ts.appendChild(o); });
     ts.value=guessMelodyTrack(r.tracks);
     $("cleanSel").value = r.bends>50 ? "2" : "0";
     fillSongs(); $("songSel").value="midi"; $("trackRow").style.display="flex"; loadTrack();
-    toast(r.bends>50 ? "Parece una voz grabada: la limpié para que queden notas largas 🧹" : "Elegí la pista de la voz si no es la correcta 👆");
+    toast(r.bends>50 ? "Voz grabada: la limpié para que queden notas claras 🧹" : "Elegí la pista de la voz si no es la correcta 👆");
   }catch(err){ toast("No pude leer ese archivo: "+err.message); }
   e.target.value="";
 };
+// Audio con voz -> notas (se procesa en el dispositivo)
+async function audioFileToTracks(ab){
+  toast("Analizando el audio… 0%");
+  const AC=window.AudioContext||window.webkitAudioContext; const dc=ctx||new AC();
+  const buf=await dc.decodeAudioData(ab); if(!ctx) dc.close&&dc.close();
+  const sr=16000, off=new OfflineAudioContext(1, Math.ceil(buf.duration*sr), sr);
+  const s=off.createBufferSource(); s.buffer=buf; s.connect(off.destination); s.start();
+  const x=(await off.startRendering()).getChannelData(0);
+  const N=1024, hop=320, total=Math.max(0,Math.floor((x.length-N)/hop)), fr=new Array(total);
+  for(let i=0;i<total;i++){ const f=detectPitch(x.subarray(i*hop,i*hop+N), sr, 70, 900); fr[i]= f>0?freqToMidi(f):null;
+    if(i%400===0){ toast("Analizando el audio… "+Math.round(100*i/total)+"%"); await new Promise(r=>setTimeout(r)); } }
+  const notes=framesToNotes(fr, hop/sr);
+  if(!notes.length) return {tracks:[], bends:0};
+  return {tracks:[{name:"Voz del audio", notes, count:notes.length, avg:notes.reduce((s,n)=>s+n.midi,0)/notes.length}], bends:999};
+}
 function loadTrack(){ const t=midiData.tracks[+$("trackSel").value], cl=+$("cleanSel").value;
   const n= cl ? cleanVoice(t.notes, cl===2) : toMonophonic(t.notes); setSong(midiData.file, n); }
 $("trackSel").onchange=loadTrack; $("cleanSel").onchange=loadTrack;
